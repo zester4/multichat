@@ -1,0 +1,8 @@
+streamlit
+python-dotenv
+groq
+google-genai
+google-generativeai
+together
+colorama
+
