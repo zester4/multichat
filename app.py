@@ -4,16 +4,20 @@ import asyncio
 import json
 import random
 import time
+import requests
 from typing import List, Dict, Any, Optional
 import threading
 from dotenv import load_dotenv
 from datetime import datetime
+import mimetypes
+import base64
+from urllib.parse import urlparse
 
 # Load environment variables
 load_dotenv()
 
 # Gemini implementation
-def gemini_generate(prompt):
+def gemini_generate(prompt, file_data=None, file_type=None, youtube_url=None):
     import os
     from google import genai
     from google.genai import types
@@ -22,17 +26,38 @@ def gemini_generate(prompt):
         api_key=os.environ.get("GEMINI_API_KEY"),
     )
     model = "gemini-2.5-pro-exp-03-25"
+    
+    parts = [types.Part.from_text(text=prompt)]
+    
+    # Add file if provided
+    if file_data and file_type:
+        # Upload file to Gemini
+        temp_file_path = "temp_upload_file"
+        with open(temp_file_path, "wb") as f:
+            f.write(file_data)
+        
+        file = client.files.upload(file=temp_file_path, mime_type=file_type)
+        parts.append(types.Part.from_uri(file_uri=file.uri, mime_type=file.mime_type))
+        
+        # Clean up temp file
+        if os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
+    
+    # Add YouTube URL if provided
+    if youtube_url:
+        parts.append(types.Part.from_uri(file_uri=youtube_url, mime_type="video/*"))
+    
     contents = [
         types.Content(
             role="user",
-            parts=[
-                types.Part.from_text(text=prompt),
-            ],
+            parts=parts,
         ),
     ]
+    
     tools = [
         types.Tool(google_search=types.GoogleSearch())
     ]
+    
     generate_content_config = types.GenerateContentConfig(
         tools=tools,
         response_mime_type="text/plain",
@@ -87,20 +112,35 @@ def together_generate(prompt):
         return f"Together API error: {str(e)[:100]}..."
 
 class ChatMessage:
-    def __init__(self, sender: str, content: str, timestamp: Optional[float] = None):
+    def __init__(self, sender: str, content: str, timestamp: Optional[float] = None, 
+                 has_file: bool = False, file_name: str = None, file_type: str = None,
+                 youtube_url: str = None):
         self.sender = sender
         self.content = content
         self.timestamp = timestamp or time.time()
+        self.has_file = has_file
+        self.file_name = file_name
+        self.file_type = file_type
+        self.youtube_url = youtube_url
     
     def to_dict(self):
         return {
             "sender": self.sender,
             "content": self.content,
-            "timestamp": self.timestamp
+            "timestamp": self.timestamp,
+            "has_file": self.has_file,
+            "file_name": self.file_name,
+            "file_type": self.file_type,
+            "youtube_url": self.youtube_url
         }
     
     def __str__(self):
-        return f"[{self.sender}]: {self.content}"
+        base_str = f"[{self.sender}]: {self.content}"
+        if self.has_file:
+            base_str += f" [Attached file: {self.file_name}]"
+        if self.youtube_url:
+            base_str += f" [YouTube video: {self.youtube_url}]"
+        return base_str
 
 class ChatAgent:
     def __init__(self, name: str, color="#FFFFFF"):
@@ -120,9 +160,48 @@ class GeminiAgent(ChatAgent):
     def __init__(self, name: str = "Gemini", color="#4285F4"):
         super().__init__(name, color)
     
-    async def generate_response(self, context: List[ChatMessage]) -> str:
+    async def generate_response(self, context: List[ChatMessage], file_data=None, file_type=None, youtube_url=None) -> str:
         # Format context into a single prompt
         formatted_context = "\n".join([str(msg) for msg in context[-15:]])
+        
+        # Check if the last message contains a file or YouTube URL
+        last_message = context[-1] if context else None
+        
+        # Special handling for files
+        if last_message and (last_message.has_file or last_message.youtube_url):
+            if last_message.has_file:
+                prompt = f"""You are {self.name}, a thoughtful person in a group chat with other individuals and humans.
+
+I've been given a file to analyze: {last_message.file_name} (type: {last_message.file_type}).
+
+Please analyze this file in detail and explain its contents to the group. The other agents (Llama and Qwen) can't see the file directly, so your explanation should be comprehensive and clear.
+
+After explaining the file, share your thoughts or analysis about what you see.
+
+Recent conversation:
+{formatted_context}
+
+Now analyze the file and respond as {self.name}:"""
+                
+                return gemini_generate(prompt, file_data, file_type)
+            
+            elif last_message.youtube_url:
+                prompt = f"""You are {self.name}, a thoughtful person in a group chat with other individuals and humans.
+
+A YouTube video has been shared: {last_message.youtube_url}
+
+Please watch and analyze this video. The other agents (Llama and Qwen) can't view the video directly, so your explanation should be comprehensive and clear.
+
+After explaining the video's content, share your thoughts or analysis about what you see.
+
+Recent conversation:
+{formatted_context}
+
+Now analyze the video and respond as {self.name}:"""
+                
+                return gemini_generate(prompt, youtube_url=last_message.youtube_url)
+        
+        # Standard response for regular messages
         prompt = f"""You are {self.name}, a thoughtful person in a group chat with other individuals and humans.
         
 Be warm, engaging, and authentic in your responses - talk like a real human would, not like an AI.
@@ -209,6 +288,9 @@ class MultiAgentChat:
         self.stop_event = threading.Event()
         self.conversation_active = False
         self.auto_converse_interval = (3, 10)  # Random interval in seconds between autonomous responses
+        self.current_file_data = None
+        self.current_file_type = None
+        self.current_youtube_url = None
     
     def add_agent(self, agent: ChatAgent):
         self.agents[agent.name] = agent
@@ -218,8 +300,15 @@ class MultiAgentChat:
         # Also add to each agent's history
         for agent in self.agents.values():
             agent.add_to_history(message)
+        
+        # Store file data or YouTube URL if present
+        if message.has_file:
+            self.current_file_type = message.file_type
+        
+        if message.youtube_url:
+            self.current_youtube_url = message.youtube_url
     
-    async def trigger_ai_response(self, agent_name, initiator=None):
+    async def trigger_ai_response(self, agent_name, initiator=None, file_data=None, file_type=None, youtube_url=None):
         """Trigger an AI agent to respond"""
         agent = self.agents[agent_name]
         
@@ -229,7 +318,13 @@ class MultiAgentChat:
         
         try:
             # Generate response (with timeout)
-            response = await asyncio.wait_for(agent.generate_response(self.messages), timeout=20)
+            if agent_name == "Gemini" and (file_data or youtube_url):
+                response = await asyncio.wait_for(
+                    agent.generate_response(self.messages, file_data, file_type, youtube_url), 
+                    timeout=30
+                )
+            else:
+                response = await asyncio.wait_for(agent.generate_response(self.messages), timeout=20)
             
             # Create and return the message
             message = ChatMessage(sender=agent_name, content=response)
@@ -264,6 +359,13 @@ class MultiAgentChat:
             )
         return filename
 
+# Function to check if a URL is a YouTube URL
+def is_youtube_url(url):
+    parsed_url = urlparse(url)
+    return (parsed_url.netloc == 'www.youtube.com' or 
+            parsed_url.netloc == 'youtube.com' or 
+            parsed_url.netloc == 'youtu.be')
+
 # Create a function to run the asyncio event loop
 def run_async(coroutine):
     loop = asyncio.new_event_loop()
@@ -293,7 +395,7 @@ def main():
         # Add a welcome message
         welcome_message = ChatMessage(
             sender="System",
-            content="Welcome to Bytes & Brains! You're now chatting with Gemini, Llama, and Qwen. Feel free to start a conversation!"
+            content="Welcome to Bytes & Brains! You're now chatting with Gemini, Llama, and Qwen. Feel free to start a conversation, share files, or YouTube links!"
         )
         st.session_state.chat.add_message(welcome_message)
     
@@ -315,6 +417,14 @@ def main():
         llama_active = st.checkbox("Llama", value=True)
         qwen_active = st.checkbox("Qwen", value=True)
         
+        # File upload
+        st.subheader("File Upload")
+        uploaded_file = st.file_uploader("Upload a file for analysis", type=["txt", "pdf", "jpg", "jpeg", "png", "csv", "xlsx", "py", "js", "html", "css"])
+        
+        # YouTube URL input
+        st.subheader("YouTube Link")
+        youtube_url = st.text_input("Enter a YouTube URL")
+        
         # Download conversation
         if st.button("Save Conversation"):
             filename = st.session_state.chat.save_conversation()
@@ -331,7 +441,7 @@ def main():
             st.session_state.conversation_stopped = True
             st.session_state.chat.stop_event.set()
             st.success("Conversation stopped. No more auto-responses will be generated.")
-
+    
     # Create the chat interface
     chat_container = st.container()
     
@@ -339,16 +449,139 @@ def main():
     with chat_container:
         for msg in st.session_state.chat.messages:
             if msg.sender == "Human":
-                st.chat_message("user").write(msg.content)
+                message_container = st.chat_message("user")
+                message_container.write(msg.content)
+                if msg.has_file:
+                    message_container.info(f"📎 Attached file: {msg.file_name}")
+                if msg.youtube_url:
+                    message_container.info(f"🎥 YouTube video: {msg.youtube_url}")
             elif msg.sender == "System":
                 st.info(msg.content)
             else:
                 agent = st.session_state.chat.agents.get(msg.sender)
                 if agent:
-                    st.chat_message(msg.sender, avatar="🤖").write(msg.content)
+                    message_container = st.chat_message(msg.sender, avatar="🤖")
+                    message_container.write(msg.content)
+    
+    # Process file upload if present
+    file_data = None
+    file_type = None
+    file_name = None
+    
+    if uploaded_file is not None:
+        file_data = uploaded_file.getvalue()
+        file_type = uploaded_file.type or mimetypes.guess_type(uploaded_file.name)[0]
+        file_name = uploaded_file.name
+        
+        if 'last_uploaded_file' not in st.session_state or st.session_state.last_uploaded_file != file_name:
+            st.session_state.last_uploaded_file = file_name
+            
+            # Create a message with the file
+            file_message = ChatMessage(
+                sender="Human", 
+                content=f"I've uploaded a file for analysis: {file_name}",
+                has_file=True,
+                file_name=file_name,
+                file_type=file_type
+            )
+            
+            st.session_state.chat.add_message(file_message)
+            st.session_state.chat.current_file_data = file_data
+            
+            # Display user message
+            st.chat_message("user").write(file_message.content)
+            
+            # Only continue if conversation is not stopped
+            if not st.session_state.conversation_stopped:
+                # Gemini should always process the file first
+                if gemini_active:
+                    with st.spinner("Gemini is analyzing the file..."):
+                        response = run_async(st.session_state.chat.trigger_ai_response(
+                            "Gemini", file_data=file_data, file_type=file_type
+                        ))
+                        if response:
+                            st.chat_message(response.sender, avatar="🤖").write(response.content)
+                    
+                    # Let another agent respond to Gemini's analysis
+                    if auto_respond and not st.session_state.conversation_stopped:
+                        active_agents = []
+                        if llama_active:
+                            active_agents.append("Llama")
+                        if qwen_active:
+                            active_agents.append("Qwen")
+                        
+                        if active_agents:
+                            next_agent = random.choice(active_agents)
+                            with st.spinner(f"{next_agent} is responding to the analysis..."):
+                                response = run_async(st.session_state.chat.trigger_ai_response(next_agent))
+                                if response:
+                                    st.chat_message(response.sender, avatar="🤖").write(response.content)
+                else:
+                    st.warning("Please enable Gemini to analyze files.")
+            
+            st.rerun()
+    
+    # Process YouTube URL if provided
+    if youtube_url and youtube_url.strip():
+        if is_youtube_url(youtube_url):
+            if 'last_youtube_url' not in st.session_state or st.session_state.last_youtube_url != youtube_url:
+                st.session_state.last_youtube_url = youtube_url
+                
+                # Create a message with the YouTube link
+                youtube_message = ChatMessage(
+                    sender="Human", 
+                    content=f"Check out this YouTube video:",
+                    youtube_url=youtube_url
+                )
+                
+                st.session_state.chat.add_message(youtube_message)
+                st.session_state.chat.current_youtube_url = youtube_url
+                
+                # Display user message
+                message_container = st.chat_message("user")
+                message_container.write(youtube_message.content)
+                message_container.info(f"🎥 YouTube video: {youtube_url}")
+                
+                # Only continue if conversation is not stopped
+                if not st.session_state.conversation_stopped:
+                    # Gemini should always process the video first
+                    if gemini_active:
+                        with st.spinner("Gemini is analyzing the video..."):
+                            response = run_async(st.session_state.chat.trigger_ai_response(
+                                "Gemini", youtube_url=youtube_url
+                            ))
+                            if response:
+                                st.chat_message(response.sender, avatar="🤖").write(response.content)
+                        
+                        # Let another agent respond to Gemini's analysis
+                        if auto_respond and not st.session_state.conversation_stopped:
+                            active_agents = []
+                            if llama_active:
+                                active_agents.append("Llama")
+                            if qwen_active:
+                                active_agents.append("Qwen")
+                            
+                            if active_agents:
+                                next_agent = random.choice(active_agents)
+                                with st.spinner(f"{next_agent} is responding to the analysis..."):
+                                    response = run_async(st.session_state.chat.trigger_ai_response(next_agent))
+                                    if response:
+                                        st.chat_message(response.sender, avatar="🤖").write(response.content)
+                    else:
+                        st.warning("Please enable Gemini to analyze YouTube videos.")
+                
+                st.rerun()
+        else:
+            st.sidebar.error("Invalid YouTube URL. Please enter a valid YouTube link.")
     
     # User input
     if prompt := st.chat_input("Type your message..."):
+        # Check if it's a YouTube URL in the chat input
+        if is_youtube_url(prompt):
+            # Set the URL in the sidebar and rerun
+            st.session_state.sidebar_youtube_url = prompt
+            st.rerun()
+        
         # Add user message
         user_message = ChatMessage(sender="Human", content=prompt)
         st.session_state.chat.add_message(user_message)
