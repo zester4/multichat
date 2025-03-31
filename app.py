@@ -197,6 +197,7 @@ After explaining the video's content, share your thoughts or analysis about what
 Recent conversation:
 {formatted_context}
 
+IMPORTANT: Keep your response under 3 lines or sentences unless explicitly you are asked to make it long or writing a content - be concise and direct.
 Now analyze the video and respond as {self.name}:"""
                 
                 return gemini_generate(prompt, youtube_url=last_message.youtube_url)
@@ -219,6 +220,7 @@ Feel free to:
 Recent conversation:
 {formatted_context}
 
+IMPORTANT: Keep your response under 3 lines or sentences unless explicitly you are asked to make it long or writing a content - be concise and direct.
 Now respond as {self.name}, a real person with your own perspective:"""
         
         return gemini_generate(prompt)
@@ -245,6 +247,8 @@ Be genuine and human-like in your interactions:
 
 Recent conversation:
 {formatted_context}
+
+IMPORTANT: Keep your response under 3 lines or sentences unless explicitly you are asked to make it long or writing a content - be concise and direct.
 
 Now respond as {self.name}, in your authentic voice:"""
         
